@@ -92,7 +92,7 @@ jobs:
 
           # GitHub API access.
           VCS__HTTP_CLIENT__API_URL: "https://api.github.com"
-          VCS__HTTP_CLIENT__API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VCS__HTTP_CLIENT__API_TOKEN: ${{ secrets.ITHUB_TOKEN }}
 
           # ===============================
           # Core (execution settings)
