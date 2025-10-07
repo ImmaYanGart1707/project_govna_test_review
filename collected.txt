@@ -1,0 +1,1153 @@
+=== Collected files (total: 26) ===
+
+---- FILE: \\?\C:\SRC\PL\SHARP\Knigavuhe\Knigavuhe\Clients\KnigavuheClient.cs ----
+﻿using System.Net;
+using Knigavuhe.Models;
+using Knigavuhe.Services;
+using Polly;
+using Polly.Extensions.Http;
+
+namespace Knigavuhe.Clients;
+
+public class KnigavuheClient
+{
+    private readonly KnigavuheParser _knigavuheParser;
+    private readonly Config _config;
+    private readonly List<HttpClient> _httpClients;
+    private readonly IAsyncPolicy<HttpResponseMessage> _retryPolicy;
+    private int _currentProxyIndex;
+
+    public KnigavuheClient(KnigavuheParser knigavuheParser, Config config)
+    {
+        _knigavuheParser = knigavuheParser;
+        _config = config;
+        _httpClients = CreateHttpClients();
+        _retryPolicy = CreateRetryPolicy();
+    }
+
+    public async Task<List<string>> GetAuthorsLinks(int page)
+    {
+        var url = $"https://knigavuhe.org/readers/{page}/?sort=popularity&period=alltime&asc=0";
+        
+        var response = await _retryPolicy.ExecuteAsync(async () =>
+        {
+            var client = GetNextHttpClient();
+            var message = new HttpRequestMessage(HttpMethod.Get, url);
+            message.Headers.Add("cookie", "new_design=1;");
+            var result = await client.SendAsync(message);
+            result.EnsureSuccessStatusCode();
+            return result;
+        });
+
+        var responseString = await response.Content.ReadAsStringAsync();
+        return _knigavuheParser.GetAuthorsLinks(responseString);
+    }
+    
+    public async Task<Author> GetAuthor(string author)
+    {
+        var rootUrl = "https://knigavuhe.org";
+        var url = $"{rootUrl}{author}";
+        
+        var response = await _retryPolicy.ExecuteAsync(async () =>
+        {
+            var client = GetNextHttpClient();
+            var message = new HttpRequestMessage(HttpMethod.Get, url);
+            message.Headers.Add("cookie", "new_design=1;");
+            var result = await client.SendAsync(message);
+            result.EnsureSuccessStatusCode();
+            return result;
+        });
+
+        var responseString = await response.Content.ReadAsStringAsync();
+        return _knigavuheParser.GetAuthor(responseString, rootUrl, url);
+    }
+
+    public async Task<List<AudioTrack>> GetTracks(string bookLink)
+    {
+        var response = await _retryPolicy.ExecuteAsync(async () =>
+        {
+            var client = GetNextHttpClient();
+            var message = new HttpRequestMessage(HttpMethod.Get, bookLink);
+            message.Headers.Add("cookie", "new_design=1;");
+            var result = await client.SendAsync(message);
+            result.EnsureSuccessStatusCode();
+            return result;
+        });
+
+        var responseString = await response.Content.ReadAsStringAsync();
+        return _knigavuheParser.GetAudioTracks(responseString);
+    }
+
+    public async Task<string> GetMp3S(AudioTrack audioTrack)
+    {
+        var path = $"{_config.Csv.Mp3Path}/" +
+                   $"{audioTrack.PlayerData.Readers}_" +
+                   $"{audioTrack.Title}({audioTrack.Duration}).mp3";
+        
+        await _retryPolicy.ExecuteAsync(async () =>
+        {
+            var client = GetNextHttpClient();
+            var response = await client.GetAsync(audioTrack.Url, HttpCompletionOption.ResponseHeadersRead);
+            response.EnsureSuccessStatusCode();
+       
+            var totalBytes = response.Content.Headers.ContentLength ?? -1;
+            var totalBytesRead = 0L;
+            var buffer = new byte[8192];
+            
+            await using var contentStream = await response.Content.ReadAsStreamAsync();
+            await using var fileStream = new FileStream(
+                path, 
+                FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 8192, useAsync: true);
+       
+            int bytesRead;
+            var bytesOffset = 0;
+            while ((bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+            {
+                await fileStream.WriteAsync(buffer, 0, bytesRead);
+                totalBytesRead += bytesRead;
+                bytesOffset += bytesRead;
+           
+                if (totalBytes > 0 && bytesOffset > 1000000)
+                {
+                    bytesOffset = 0;
+                    var progressPercentage = (double)totalBytesRead / totalBytes * 100;
+                    Console.WriteLine($"Скачано: {totalBytesRead:N0} / {totalBytes:N0} байт ({progressPercentage:F1}%)");
+                }
+            }
+       
+            return response;
+        });
+
+        return path;
+    }
+    
+    private IAsyncPolicy<HttpResponseMessage> CreateRetryPolicy()
+    {
+        return HttpPolicyExtensions
+            .HandleTransientHttpError()
+            .OrResult(msg => !msg.IsSuccessStatusCode)
+            .WaitAndRetryAsync(
+                retryCount: 3,
+                sleepDurationProvider: retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
+                onRetry: (_, timespan, retryCount, _) =>
+                {
+                    Console.WriteLine($"Retry {retryCount} after {timespan} seconds");
+                });
+    }
+    
+    private List<HttpClient> CreateHttpClients()
+    {
+        var clients = new List<HttpClient>();
+        for (int port = 9001; port <= 9050; port++)
+        {
+            var proxy = new WebProxy($"192.168.4.2:{port}");
+            
+            var handler = new SocketsHttpHandler
+            {
+                Proxy = proxy,
+                UseProxy = true
+            };
+
+            var client = new HttpClient(handler);
+            client.Timeout = TimeSpan.FromSeconds(30);
+            
+            clients.Add(client);
+        }
+        
+        return clients;
+    }
+    
+    private HttpClient GetNextHttpClient()
+    {
+        var client = _httpClients[_currentProxyIndex];
+        _currentProxyIndex = (_currentProxyIndex + 1) % _httpClients.Count;
+        return client;
+    }
+}
+
+
+---- FILE: \\?\C:\SRC\PL\SHARP\Knigavuhe\Knigavuhe\Controllers\KnigavuheController.cs ----
+﻿using Knigavuhe.Services;
+using Microsoft.AspNetCore.Mvc;
+
+namespace Knigavuhe.Controllers;
+
+[ApiController]
+[Route("[controller]")]
+public class KnigavuheController(
+    KnigavuheService knigavuheService) : ControllerBase
+{
+    [HttpGet("WriteAuthorsLinksToCsv")]
+    public async Task<IActionResult> WriteAuthorsLinksToCsv()
+    {
+        await knigavuheService.WriteAuthorsLinksToCsv();
+        return Ok();
+    }
+    
+    [HttpGet("WriteAuthorsToCsv")]
+    public async Task<IActionResult> WriteAuthorsToCsv()
+    {
+        await knigavuheService.WriteAuthorsToCsv();
+        return Ok();
+    }
+    
+    [HttpGet("WriteTrackToCsv")]
+    public async Task<IActionResult> WriteTrackToCsv()
+    {
+        await knigavuheService.WriteTrackToCsv();
+        return Ok();
+    }
+    
+    [HttpGet("DownloadMp3")]
+    public async Task<IActionResult> DownloadMp3()
+    {
+        await knigavuheService.DownloadMp3();
+        return Ok();
+    }
+}
+
+
+---- FILE: \\?\C:\SRC\PL\SHARP\Knigavuhe\Knigavuhe\Models\AudioTrack.cs ----
+﻿namespace Knigavuhe.Models;
+
+using Newtonsoft.Json;
+
+public class AudioTrack
+{
+    [JsonProperty("id")]
+    public int Id { get; set; }
+
+    [JsonProperty("title")]
+    public string Title { get; set; } = null!;
+
+    [JsonProperty("url")]
+    public string Url { get; set; } = null!;
+
+    [JsonProperty("player_data")]
+    public PlayerData PlayerData { get; set; } = new();
+
+    [JsonProperty("duration")]
+    public double Duration { get; set; }
+}
+
+public class PlayerData
+{
+    [JsonProperty("title")]
+    public string Title { get; set; } = null!;
+
+    [JsonProperty("cover")]
+    public string Cover { get; set; } = null!;
+
+    [JsonProperty("cover_type")]
+    public string CoverType { get; set; } = null!;
+
+    [JsonProperty("readers")]
+    public string Readers { get; set; } = null!;
+
+    [JsonProperty("series")]
+    public string Series { get; set; } = null!;
+}
+
+
+---- FILE: \\?\C:\SRC\PL\SHARP\Knigavuhe\Knigavuhe\Models\Author.cs ----
+﻿namespace Knigavuhe.Models;
+
+public class Author
+{
+    public string Name { get; set; } = null!;
+    public string Link { get; set; } = null!;
+    public string BookLink { get; set; } = null!;
+}
+
+
+---- FILE: \\?\C:\SRC\PL\SHARP\Knigavuhe\Knigavuhe\Models\AuthorLink.cs ----
+﻿namespace Knigavuhe.Models;
+
+public class AuthorLink
+{
+    public string Link { get; set; } = null!;
+}
+
+
+---- FILE: \\?\C:\SRC\PL\SHARP\Knigavuhe\Knigavuhe\Models\Config.cs ----
+﻿namespace Knigavuhe.Models;
+
+public class Config(IConfiguration configuration)
+{
+    public CsvConfig Csv { get; set; } = configuration.GetSection("CsvConfig").Get<CsvConfig>() ?? new CsvConfig();
+}
+
+
+---- FILE: \\?\C:\SRC\PL\SHARP\Knigavuhe\Knigavuhe\Models\CsvConfig.cs ----
+﻿namespace Knigavuhe.Models;
+
+public class CsvConfig
+{
+    public int MaxAuthors { get; set; } = 1000;
+    public string AuthorsLinksCsvFilePath { get; set; } = null!;
+    public string AuthorsCsvFilePath { get; set; } = null!;
+    public string TracksCsvFilePath { get; set; } = null!;
+    public string TracksInfoCsvFilePath { get; set; } = null!;
+    public string Mp3Path { get; set; } = null!;
+    public int MaxDurationMin { get; set; } = 30;
+}
+
+
+---- FILE: \\?\C:\SRC\PL\SHARP\Knigavuhe\Knigavuhe\Models\DownloadProgress.cs ----
+﻿namespace Knigavuhe.Models;
+
+public class DownloadProgress(long bytesDownloaded, long totalBytes)
+{
+    public long BytesDownloaded { get; } = bytesDownloaded;
+    public long TotalBytes { get; } = totalBytes;
+
+    public double? ProgressPercentage => TotalBytes > 0 ? 
+        (double)BytesDownloaded / TotalBytes * 100 : null;
+}
+
+
+---- FILE: \\?\C:\SRC\PL\SHARP\Knigavuhe\Knigavuhe\Models\Mp3Path.cs ----
+﻿namespace Knigavuhe.Models;
+
+public class Mp3Path
+{
+    public string Path { get; set; } = null!;
+    public double Duration { get; set; }
+}
+
+
+---- FILE: \\?\C:\SRC\PL\SHARP\Knigavuhe\Knigavuhe\Program.cs ----
+using Knigavuhe.Clients;
+using Knigavuhe.Models;
+using Knigavuhe.Services;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+builder.Services.AddSingleton<Config>();
+builder.Services.AddSingleton<KnigavuheClient>();
+builder.Services.AddSingleton<KnigavuheService>();
+builder.Services.AddSingleton<KnigavuheParser>();
+builder.Services.AddSingleton<CsvService>();
+
+var app = builder.Build();
+app.MapControllers();
+app.UseSwagger();
+app.UseSwaggerUI();
+app.Run();
+
+
+---- FILE: \\?\C:\SRC\PL\SHARP\Knigavuhe\Knigavuhe\Services\CsvService.cs ----
+﻿using System.Globalization;
+using CsvHelper;
+using CsvHelper.Configuration;
+
+namespace Knigavuhe.Services;
+
+public class CsvService
+{
+    public List<T> ReadCsv<T>(string filePath)
+    {
+        using var reader = new StreamReader(filePath);
+        using var csv = new CsvReader(reader, CultureInfo.InvariantCulture);
+        return csv.GetRecords<T>().ToList();
+    }
+
+    public void WriteCsv<T>(string filePath, IEnumerable<T> records)
+    {
+        var fileExists = File.Exists(filePath) && new FileInfo(filePath).Length > 0;
+        
+        var config = new CsvConfiguration(CultureInfo.InvariantCulture)
+        {
+            HasHeaderRecord = !fileExists
+        };
+        
+        using var writer = new StreamWriter(filePath, append: true);
+        using var csv = new CsvWriter(writer, config);
+        
+        csv.WriteRecords(records);
+    }
+}
+
+
+---- FILE: \\?\C:\SRC\PL\SHARP\Knigavuhe\Knigavuhe\Services\KnigavuheParser.cs ----
+﻿using System.Text;
+using System.Text.RegularExpressions;
+using HtmlAgilityPack;
+using Knigavuhe.Models;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+
+namespace Knigavuhe.Services;
+
+public class KnigavuheParser
+{
+    public List<string> GetAuthorsLinks(string html)
+    {
+        return GetHrefs(html, "/reader/");
+    }
+    
+    public List<string> GetBooksLinks(string html)
+    {
+        return GetHrefs(html, "/book/");
+    }
+
+    public Author GetAuthor(string html, string rootUrl, string url)
+    {
+        var doc = new HtmlDocument();
+        doc.LoadHtml(html);
+
+        var name = "Empty";
+        var nameNode = doc.DocumentNode.SelectSingleNode("//div[@class='author_header_name']");
+
+        var bookLink = GetBooksLinks(html);
+        var bl = bookLink.Count > 1 ? bookLink[1] : (bookLink.Count > 0 ? bookLink.First() : "/book/chumaznik/");
+        
+        return new Author
+        {
+            Name = name,
+            Link = url,
+            BookLink = $"{rootUrl}{bl}"
+        };
+    }
+    
+    public List<AudioTrack> GetAudioTracks(string input)
+    {
+        var playlistStart = input.IndexOf("\"playlist\":", StringComparison.InvariantCulture);
+        var arrayStart = input.IndexOf('[', playlistStart);
+
+        var bracketCount = 0;
+        var arrayEnd = -1;
+
+        for (int i = arrayStart; i < input.Length; i++)
+        {
+            if (input[i] == '[')
+            {
+                bracketCount++;
+            }
+            else if (input[i] == ']')
+            {
+                bracketCount--;
+                if (bracketCount == 0)
+                {
+                    arrayEnd = i;
+                    break;
+                }
+            }
+        }
+
+        if (arrayEnd == -1)
+        {
+            throw new Exception("Eee chto-to ne tak 1");
+        }
+
+        var jsonArray = input.Substring(arrayStart, arrayEnd - arrayStart + 1);
+
+        try
+        {
+            return JArray.Parse(jsonArray).ToObject<List<AudioTrack>>() 
+                   ?? throw new Exception("Eee chto-to ne tak 2");
+        }
+        catch (Exception e)
+        {
+            throw new Exception("Eee chto-to ne tak 3", e);
+        }
+    }
+
+    private List<string> GetHrefs(string html, string contains)
+    {
+        var doc = new HtmlDocument();
+        doc.LoadHtml(html);
+
+        return doc.DocumentNode
+            .SelectNodes($"//a[contains(@href, '{contains}') and (contains(@class, 'authors_author_cover') or contains(@class, 'book_snippet'))]")
+            .Select(node => node.GetAttributeValue("href", string.Empty))
+            .ToList();
+    }
+}
+
+
+---- FILE: \\?\C:\SRC\PL\SHARP\Knigavuhe\Knigavuhe\Services\KnigavuheService.cs ----
+﻿using System.Collections.Concurrent;
+using Knigavuhe.Clients;
+using Knigavuhe.Models;
+
+namespace Knigavuhe.Services;
+
+public class KnigavuheService(
+    KnigavuheClient knigavuheClient,
+    CsvService csvService,
+    Config config)
+{
+    public async Task WriteAuthorsLinksToCsv()
+    {
+        var page = 0;
+        var authorsCount = 0;
+        while (authorsCount <= config.Csv.MaxAuthors)
+        {
+            var authorsLinksString = await knigavuheClient.GetAuthorsLinks(page);
+            var authorsLinks = authorsLinksString.Select(
+                link => new AuthorLink { Link = link }).ToList();
+
+            csvService.WriteCsv(config.Csv.AuthorsLinksCsvFilePath, authorsLinks);
+
+            page++;
+            authorsCount += authorsLinks.Count;
+            
+            Console.WriteLine($"Получено {authorsLinks.Count}({authorsCount}/{config.Csv.MaxAuthors}) ссылок на авторов");
+            await Task.Delay(1000);
+        }
+    }
+
+    public async Task WriteAuthorsToCsv()
+    {
+        var authors = new List<Author>();
+        var authorLinks = csvService.ReadCsv<AuthorLink>(config.Csv.AuthorsLinksCsvFilePath);
+        var authorsCount = 0;
+        await Parallel.ForEachAsync(authorLinks, new ParallelOptions { MaxDegreeOfParallelism = 10 }, async (authorLink, ct) =>
+        {
+            var author = await knigavuheClient.GetAuthor(authorLink.Link);
+            authors.Add(author);
+
+            Interlocked.Increment(ref authorsCount);
+            
+            Console.WriteLine($"Получено {author.Name} ({authorsCount}/{authorLinks.Count})");
+            await Task.Delay(1000, ct);
+        });
+        
+        csvService.WriteCsv(config.Csv.AuthorsCsvFilePath, authors);
+        Console.WriteLine($"Сохранено {authors.Count}");
+    }
+
+    public async Task WriteTrackToCsv()
+    {
+        var allTracks = new ConcurrentBag<AudioTrack>();
+        var authors = csvService.ReadCsv<Author>(config.Csv.AuthorsCsvFilePath);
+        var authorsCount = 0;
+        await Parallel.ForEachAsync(authors, new ParallelOptions { MaxDegreeOfParallelism = 15 }, async (author, _) =>
+        {
+            var tracks = await knigavuheClient.GetTracks(author.BookLink);
+
+            foreach (var track in tracks)
+            {
+                allTracks.Add(track);
+            }
+            
+            Interlocked.Increment(ref authorsCount);
+            
+            Console.WriteLine($"Получено {tracks.Count} треков для {author.Name} ({authorsCount}/{authors.Count})");
+        });
+        
+        csvService.WriteCsv(config.Csv.TracksCsvFilePath, allTracks);
+    }
+
+    public async Task DownloadMp3()
+    {
+        var tracks = csvService.ReadCsv<AudioTrack>(config.Csv.TracksCsvFilePath);
+        var groupedTracks = tracks.GroupBy(track => track.PlayerData.Title);
+
+        foreach (var group in groupedTracks)
+        {
+            var tracksDuration = 0.0d;
+            var tracksPaths = new List<Mp3Path>();
+            
+            Console.WriteLine($"Грузим \"{group.First().Title}\"");
+            
+            foreach (var track in group)
+            {
+                var path = await knigavuheClient.GetMp3S(track);
+                tracksPaths.Add(new Mp3Path { Path = path, Duration = track.Duration });
+                
+                tracksDuration += track.Duration;
+                
+                if (tracksDuration >= TimeSpan.FromMinutes(config.Csv.MaxDurationMin).TotalSeconds)
+                {
+                    break;
+                }
+            }
+            
+            csvService.WriteCsv(config.Csv.Mp3Path, tracksPaths);
+        }
+    }
+}
+
+
+---- FILE: .\Knigavuhe\Clients\KnigavuheClient.cs ----
+﻿using System.Net;
+using Knigavuhe.Models;
+using Knigavuhe.Services;
+using Polly;
+using Polly.Extensions.Http;
+
+namespace Knigavuhe.Clients;
+
+public class KnigavuheClient
+{
+    private readonly KnigavuheParser _knigavuheParser;
+    private readonly Config _config;
+    private readonly List<HttpClient> _httpClients;
+    private readonly IAsyncPolicy<HttpResponseMessage> _retryPolicy;
+    private int _currentProxyIndex;
+
+    public KnigavuheClient(KnigavuheParser knigavuheParser, Config config)
+    {
+        _knigavuheParser = knigavuheParser;
+        _config = config;
+        _httpClients = CreateHttpClients();
+        _retryPolicy = CreateRetryPolicy();
+    }
+
+    public async Task<List<string>> GetAuthorsLinks(int page)
+    {
+        var url = $"https://knigavuhe.org/readers/{page}/?sort=popularity&period=alltime&asc=0";
+        
+        var response = await _retryPolicy.ExecuteAsync(async () =>
+        {
+            var client = GetNextHttpClient();
+            var message = new HttpRequestMessage(HttpMethod.Get, url);
+            message.Headers.Add("cookie", "new_design=1;");
+            var result = await client.SendAsync(message);
+            result.EnsureSuccessStatusCode();
+            return result;
+        });
+
+        var responseString = await response.Content.ReadAsStringAsync();
+        return _knigavuheParser.GetAuthorsLinks(responseString);
+    }
+    
+    public async Task<Author> GetAuthor(string author)
+    {
+        var rootUrl = "https://knigavuhe.org";
+        var url = $"{rootUrl}{author}";
+        
+        var response = await _retryPolicy.ExecuteAsync(async () =>
+        {
+            var client = GetNextHttpClient();
+            var message = new HttpRequestMessage(HttpMethod.Get, url);
+            message.Headers.Add("cookie", "new_design=1;");
+            var result = await client.SendAsync(message);
+            result.EnsureSuccessStatusCode();
+            return result;
+        });
+
+        var responseString = await response.Content.ReadAsStringAsync();
+        return _knigavuheParser.GetAuthor(responseString, rootUrl, url);
+    }
+
+    public async Task<List<AudioTrack>> GetTracks(string bookLink)
+    {
+        var response = await _retryPolicy.ExecuteAsync(async () =>
+        {
+            var client = GetNextHttpClient();
+            var message = new HttpRequestMessage(HttpMethod.Get, bookLink);
+            message.Headers.Add("cookie", "new_design=1;");
+            var result = await client.SendAsync(message);
+            result.EnsureSuccessStatusCode();
+            return result;
+        });
+
+        var responseString = await response.Content.ReadAsStringAsync();
+        return _knigavuheParser.GetAudioTracks(responseString);
+    }
+
+    public async Task<string> GetMp3S(AudioTrack audioTrack)
+    {
+        var path = $"{_config.Csv.Mp3Path}/" +
+                   $"{audioTrack.PlayerData.Readers}_" +
+                   $"{audioTrack.Title}({audioTrack.Duration}).mp3";
+        
+        await _retryPolicy.ExecuteAsync(async () =>
+        {
+            var client = GetNextHttpClient();
+            var response = await client.GetAsync(audioTrack.Url, HttpCompletionOption.ResponseHeadersRead);
+            response.EnsureSuccessStatusCode();
+       
+            var totalBytes = response.Content.Headers.ContentLength ?? -1;
+            var totalBytesRead = 0L;
+            var buffer = new byte[8192];
+            
+            await using var contentStream = await response.Content.ReadAsStreamAsync();
+            await using var fileStream = new FileStream(
+                path, 
+                FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 8192, useAsync: true);
+       
+            int bytesRead;
+            var bytesOffset = 0;
+            while ((bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+            {
+                await fileStream.WriteAsync(buffer, 0, bytesRead);
+                totalBytesRead += bytesRead;
+                bytesOffset += bytesRead;
+           
+                if (totalBytes > 0 && bytesOffset > 1000000)
+                {
+                    bytesOffset = 0;
+                    var progressPercentage = (double)totalBytesRead / totalBytes * 100;
+                    Console.WriteLine($"Скачано: {totalBytesRead:N0} / {totalBytes:N0} байт ({progressPercentage:F1}%)");
+                }
+            }
+       
+            return response;
+        });
+
+        return path;
+    }
+    
+    private IAsyncPolicy<HttpResponseMessage> CreateRetryPolicy()
+    {
+        return HttpPolicyExtensions
+            .HandleTransientHttpError()
+            .OrResult(msg => !msg.IsSuccessStatusCode)
+            .WaitAndRetryAsync(
+                retryCount: 3,
+                sleepDurationProvider: retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
+                onRetry: (_, timespan, retryCount, _) =>
+                {
+                    Console.WriteLine($"Retry {retryCount} after {timespan} seconds");
+                });
+    }
+    
+    private List<HttpClient> CreateHttpClients()
+    {
+        var clients = new List<HttpClient>();
+        for (int port = 9001; port <= 9050; port++)
+        {
+            var proxy = new WebProxy($"192.168.4.2:{port}");
+            
+            var handler = new SocketsHttpHandler
+            {
+                Proxy = proxy,
+                UseProxy = true
+            };
+
+            var client = new HttpClient(handler);
+            client.Timeout = TimeSpan.FromSeconds(30);
+            
+            clients.Add(client);
+        }
+        
+        return clients;
+    }
+    
+    private HttpClient GetNextHttpClient()
+    {
+        var client = _httpClients[_currentProxyIndex];
+        _currentProxyIndex = (_currentProxyIndex + 1) % _httpClients.Count;
+        return client;
+    }
+}
+
+
+---- FILE: .\Knigavuhe\Controllers\KnigavuheController.cs ----
+﻿using Knigavuhe.Services;
+using Microsoft.AspNetCore.Mvc;
+
+namespace Knigavuhe.Controllers;
+
+[ApiController]
+[Route("[controller]")]
+public class KnigavuheController(
+    KnigavuheService knigavuheService) : ControllerBase
+{
+    [HttpGet("WriteAuthorsLinksToCsv")]
+    public async Task<IActionResult> WriteAuthorsLinksToCsv()
+    {
+        await knigavuheService.WriteAuthorsLinksToCsv();
+        return Ok();
+    }
+    
+    [HttpGet("WriteAuthorsToCsv")]
+    public async Task<IActionResult> WriteAuthorsToCsv()
+    {
+        await knigavuheService.WriteAuthorsToCsv();
+        return Ok();
+    }
+    
+    [HttpGet("WriteTrackToCsv")]
+    public async Task<IActionResult> WriteTrackToCsv()
+    {
+        await knigavuheService.WriteTrackToCsv();
+        return Ok();
+    }
+    
+    [HttpGet("DownloadMp3")]
+    public async Task<IActionResult> DownloadMp3()
+    {
+        await knigavuheService.DownloadMp3();
+        return Ok();
+    }
+}
+
+
+---- FILE: .\Knigavuhe\Models\AudioTrack.cs ----
+﻿namespace Knigavuhe.Models;
+
+using Newtonsoft.Json;
+
+public class AudioTrack
+{
+    [JsonProperty("id")]
+    public int Id { get; set; }
+
+    [JsonProperty("title")]
+    public string Title { get; set; } = null!;
+
+    [JsonProperty("url")]
+    public string Url { get; set; } = null!;
+
+    [JsonProperty("player_data")]
+    public PlayerData PlayerData { get; set; } = new();
+
+    [JsonProperty("duration")]
+    public double Duration { get; set; }
+}
+
+public class PlayerData
+{
+    [JsonProperty("title")]
+    public string Title { get; set; } = null!;
+
+    [JsonProperty("cover")]
+    public string Cover { get; set; } = null!;
+
+    [JsonProperty("cover_type")]
+    public string CoverType { get; set; } = null!;
+
+    [JsonProperty("readers")]
+    public string Readers { get; set; } = null!;
+
+    [JsonProperty("series")]
+    public string Series { get; set; } = null!;
+}
+
+
+---- FILE: .\Knigavuhe\Models\Author.cs ----
+﻿namespace Knigavuhe.Models;
+
+public class Author
+{
+    public string Name { get; set; } = null!;
+    public string Link { get; set; } = null!;
+    public string BookLink { get; set; } = null!;
+}
+
+
+---- FILE: .\Knigavuhe\Models\AuthorLink.cs ----
+﻿namespace Knigavuhe.Models;
+
+public class AuthorLink
+{
+    public string Link { get; set; } = null!;
+}
+
+
+---- FILE: .\Knigavuhe\Models\Config.cs ----
+﻿namespace Knigavuhe.Models;
+
+public class Config(IConfiguration configuration)
+{
+    public CsvConfig Csv { get; set; } = configuration.GetSection("CsvConfig").Get<CsvConfig>() ?? new CsvConfig();
+}
+
+
+---- FILE: .\Knigavuhe\Models\CsvConfig.cs ----
+﻿namespace Knigavuhe.Models;
+
+public class CsvConfig
+{
+    public int MaxAuthors { get; set; } = 1000;
+    public string AuthorsLinksCsvFilePath { get; set; } = null!;
+    public string AuthorsCsvFilePath { get; set; } = null!;
+    public string TracksCsvFilePath { get; set; } = null!;
+    public string TracksInfoCsvFilePath { get; set; } = null!;
+    public string Mp3Path { get; set; } = null!;
+    public int MaxDurationMin { get; set; } = 30;
+}
+
+
+---- FILE: .\Knigavuhe\Models\DownloadProgress.cs ----
+﻿namespace Knigavuhe.Models;
+
+public class DownloadProgress(long bytesDownloaded, long totalBytes)
+{
+    public long BytesDownloaded { get; } = bytesDownloaded;
+    public long TotalBytes { get; } = totalBytes;
+
+    public double? ProgressPercentage => TotalBytes > 0 ? 
+        (double)BytesDownloaded / TotalBytes * 100 : null;
+}
+
+
+---- FILE: .\Knigavuhe\Models\Mp3Path.cs ----
+﻿namespace Knigavuhe.Models;
+
+public class Mp3Path
+{
+    public string Path { get; set; } = null!;
+    public double Duration { get; set; }
+}
+
+
+---- FILE: .\Knigavuhe\Program.cs ----
+using Knigavuhe.Clients;
+using Knigavuhe.Models;
+using Knigavuhe.Services;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+builder.Services.AddSingleton<Config>();
+builder.Services.AddSingleton<KnigavuheClient>();
+builder.Services.AddSingleton<KnigavuheService>();
+builder.Services.AddSingleton<KnigavuheParser>();
+builder.Services.AddSingleton<CsvService>();
+
+var app = builder.Build();
+app.MapControllers();
+app.UseSwagger();
+app.UseSwaggerUI();
+app.Run();
+
+
+---- FILE: .\Knigavuhe\Services\CsvService.cs ----
+﻿using System.Globalization;
+using CsvHelper;
+using CsvHelper.Configuration;
+
+namespace Knigavuhe.Services;
+
+public class CsvService
+{
+    public List<T> ReadCsv<T>(string filePath)
+    {
+        using var reader = new StreamReader(filePath);
+        using var csv = new CsvReader(reader, CultureInfo.InvariantCulture);
+        return csv.GetRecords<T>().ToList();
+    }
+
+    public void WriteCsv<T>(string filePath, IEnumerable<T> records)
+    {
+        var fileExists = File.Exists(filePath) && new FileInfo(filePath).Length > 0;
+        
+        var config = new CsvConfiguration(CultureInfo.InvariantCulture)
+        {
+            HasHeaderRecord = !fileExists
+        };
+        
+        using var writer = new StreamWriter(filePath, append: true);
+        using var csv = new CsvWriter(writer, config);
+        
+        csv.WriteRecords(records);
+    }
+}
+
+
+---- FILE: .\Knigavuhe\Services\KnigavuheParser.cs ----
+﻿using System.Text;
+using System.Text.RegularExpressions;
+using HtmlAgilityPack;
+using Knigavuhe.Models;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+
+namespace Knigavuhe.Services;
+
+public class KnigavuheParser
+{
+    public List<string> GetAuthorsLinks(string html)
+    {
+        return GetHrefs(html, "/reader/");
+    }
+    
+    public List<string> GetBooksLinks(string html)
+    {
+        return GetHrefs(html, "/book/");
+    }
+
+    public Author GetAuthor(string html, string rootUrl, string url)
+    {
+        var doc = new HtmlDocument();
+        doc.LoadHtml(html);
+
+        var name = "Empty";
+        var nameNode = doc.DocumentNode.SelectSingleNode("//div[@class='author_header_name']");
+
+        var bookLink = GetBooksLinks(html);
+        var bl = bookLink.Count > 1 ? bookLink[1] : (bookLink.Count > 0 ? bookLink.First() : "/book/chumaznik/");
+        
+        return new Author
+        {
+            Name = name,
+            Link = url,
+            BookLink = $"{rootUrl}{bl}"
+        };
+    }
+    
+    public List<AudioTrack> GetAudioTracks(string input)
+    {
+        var playlistStart = input.IndexOf("\"playlist\":", StringComparison.InvariantCulture);
+        var arrayStart = input.IndexOf('[', playlistStart);
+
+        var bracketCount = 0;
+        var arrayEnd = -1;
+
+        for (int i = arrayStart; i < input.Length; i++)
+        {
+            if (input[i] == '[')
+            {
+                bracketCount++;
+            }
+            else if (input[i] == ']')
+            {
+                bracketCount--;
+                if (bracketCount == 0)
+                {
+                    arrayEnd = i;
+                    break;
+                }
+            }
+        }
+
+        if (arrayEnd == -1)
+        {
+            throw new Exception("Eee chto-to ne tak 1");
+        }
+
+        var jsonArray = input.Substring(arrayStart, arrayEnd - arrayStart + 1);
+
+        try
+        {
+            return JArray.Parse(jsonArray).ToObject<List<AudioTrack>>() 
+                   ?? throw new Exception("Eee chto-to ne tak 2");
+        }
+        catch (Exception e)
+        {
+            throw new Exception("Eee chto-to ne tak 3", e);
+        }
+    }
+
+    private List<string> GetHrefs(string html, string contains)
+    {
+        var doc = new HtmlDocument();
+        doc.LoadHtml(html);
+
+        return doc.DocumentNode
+            .SelectNodes($"//a[contains(@href, '{contains}') and (contains(@class, 'authors_author_cover') or contains(@class, 'book_snippet'))]")
+            .Select(node => node.GetAttributeValue("href", string.Empty))
+            .ToList();
+    }
+}
+
+
+---- FILE: .\Knigavuhe\Services\KnigavuheService.cs ----
+﻿using System.Collections.Concurrent;
+using Knigavuhe.Clients;
+using Knigavuhe.Models;
+
+namespace Knigavuhe.Services;
+
+public class KnigavuheService(
+    KnigavuheClient knigavuheClient,
+    CsvService csvService,
+    Config config)
+{
+    public async Task WriteAuthorsLinksToCsv()
+    {
+        var page = 0;
+        var authorsCount = 0;
+        while (authorsCount <= config.Csv.MaxAuthors)
+        {
+            var authorsLinksString = await knigavuheClient.GetAuthorsLinks(page);
+            var authorsLinks = authorsLinksString.Select(
+                link => new AuthorLink { Link = link }).ToList();
+
+            csvService.WriteCsv(config.Csv.AuthorsLinksCsvFilePath, authorsLinks);
+
+            page++;
+            authorsCount += authorsLinks.Count;
+            
+            Console.WriteLine($"Получено {authorsLinks.Count}({authorsCount}/{config.Csv.MaxAuthors}) ссылок на авторов");
+            await Task.Delay(1000);
+        }
+    }
+
+    public async Task WriteAuthorsToCsv()
+    {
+        var authors = new List<Author>();
+        var authorLinks = csvService.ReadCsv<AuthorLink>(config.Csv.AuthorsLinksCsvFilePath);
+        var authorsCount = 0;
+        await Parallel.ForEachAsync(authorLinks, new ParallelOptions { MaxDegreeOfParallelism = 10 }, async (authorLink, ct) =>
+        {
+            var author = await knigavuheClient.GetAuthor(authorLink.Link);
+            authors.Add(author);
+
+            Interlocked.Increment(ref authorsCount);
+            
+            Console.WriteLine($"Получено {author.Name} ({authorsCount}/{authorLinks.Count})");
+            await Task.Delay(1000, ct);
+        });
+        
+        csvService.WriteCsv(config.Csv.AuthorsCsvFilePath, authors);
+        Console.WriteLine($"Сохранено {authors.Count}");
+    }
+
+    public async Task WriteTrackToCsv()
+    {
+        var allTracks = new ConcurrentBag<AudioTrack>();
+        var authors = csvService.ReadCsv<Author>(config.Csv.AuthorsCsvFilePath);
+        var authorsCount = 0;
+        await Parallel.ForEachAsync(authors, new ParallelOptions { MaxDegreeOfParallelism = 15 }, async (author, _) =>
+        {
+            var tracks = await knigavuheClient.GetTracks(author.BookLink);
+
+            foreach (var track in tracks)
+            {
+                allTracks.Add(track);
+            }
+            
+            Interlocked.Increment(ref authorsCount);
+            
+            Console.WriteLine($"Получено {tracks.Count} треков для {author.Name} ({authorsCount}/{authors.Count})");
+        });
+        
+        csvService.WriteCsv(config.Csv.TracksCsvFilePath, allTracks);
+    }
+
+    public async Task DownloadMp3()
+    {
+        var tracks = csvService.ReadCsv<AudioTrack>(config.Csv.TracksCsvFilePath);
+        var groupedTracks = tracks.GroupBy(track => track.PlayerData.Title);
+
+        foreach (var group in groupedTracks)
+        {
+            var tracksDuration = 0.0d;
+            var tracksPaths = new List<Mp3Path>();
+            
+            Console.WriteLine($"Грузим \"{group.First().Title}\"");
+            
+            foreach (var track in group)
+            {
+                var path = await knigavuheClient.GetMp3S(track);
+                tracksPaths.Add(new Mp3Path { Path = path, Duration = track.Duration });
+                
+                tracksDuration += track.Duration;
+                
+                if (tracksDuration >= TimeSpan.FromMinutes(config.Csv.MaxDurationMin).TotalSeconds)
+                {
+                    break;
+                }
+            }
+            
+            csvService.WriteCsv(config.Csv.Mp3Path, tracksPaths);
+        }
+    }
+}
+
+
+=== End ===
